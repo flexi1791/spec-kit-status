@@ -1,0 +1,57 @@
+name: Spec-Kit Dashboard
+
+on:
+  push:
+    branches: [ "main" ]
+    paths:
+      - "specs/**"
+      - ".github/scripts/spec_dashboard_sync.py"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  build-dashboard:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Generate Dashboard
+        run: python3 .github/scripts/spec_dashboard_sync.py --output README.md
+
+      - name: Debug Git State
+        run: |
+          echo "=== BRANCH ==="
+          git branch -vv
+          echo "=== STATUS ==="
+          git status
+          echo "=== REMOTE SHOW ORIGIN ==="
+          git remote show origin
+          echo "=== FETCHING ==="
+          git fetch --all
+          echo "=== LOG HEAD ==="
+          git log --oneline -5
+          echo "=== LOG ORIGIN/MAIN ==="
+          git log origin/main --oneline -5
+
+      - name: Commit Dashboard
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          git commit -m "Update Spec Dashboard" || echo "No changes"
+          git pull --rebase origin main
+          git push origin main
