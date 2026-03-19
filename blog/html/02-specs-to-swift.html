@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Day 3: From Specs to Swift — SwiftData, Migrations, and Package Architecture</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      line-height: 1.6;
+      max-width: 780px;
+      margin: 0 auto;
+      padding: 2rem 1rem;
+      color: #1d1d1f;
+    }
+    pre {
+      background: #f5f5f7;
+      border-radius: 6px;
+      padding: 1rem 1.25rem;
+      overflow-x: auto;
+    }
+    pre code {
+      font-family: "SF Mono", Menlo, Consolas, monospace;
+      font-size: 0.9em;
+    }
+    code {
+      font-family: "SF Mono", Menlo, Consolas, monospace;
+      font-size: 0.9em;
+      background: #f5f5f7;
+      padding: 0.15em 0.35em;
+      border-radius: 3px;
+    }
+    pre code {
+      background: none;
+      padding: 0;
+    }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      margin: 1rem 0;
+    }
+    th, td {
+      border: 1px solid #d2d2d7;
+      padding: 0.5rem 0.75rem;
+      text-align: left;
+    }
+    th {
+      background: #f5f5f7;
+    }
+    blockquote {
+      border-left: 3px solid #d2d2d7;
+      margin-left: 0;
+      padding-left: 1rem;
+      color: #555;
+    }
+    hr {
+      border: none;
+      border-top: 1px solid #d2d2d7;
+      margin: 2rem 0;
+    }
+  </style>
+</head>
+<body>
+
+<h1>Day 3: From Specs to Swift — SwiftData, Migrations, and Package Architecture</h1>
+
+<p><em>Part 2 of "10 Days, 400 Commits: Building a Multi-Target iOS 26 App with AI-Driven Spec Development"</em></p>
+
+<hr>
+
+<p>The spec said "offline-first with iCloud sync." Three lines of <code>ModelConfiguration</code> made that real — but the migration plan is where the spec saved us.</p>
+
+<h2>The Clarification Surge</h2>
+
+<p>Day 3 started not with code, but with the most important phase of the entire project: running <code>/speckit.clarify</code> on all 12 existing specs. Every single one.</p>
+
+<p>This produced 60+ targeted questions across the specs. Each answer was encoded back into the spec as a clarification amendment. Some examples of what was caught:</p>
+
+<ul>
+  <li><strong>Spec 001</strong> was missing duplicate detection rules. What happens when the user adds the same item twice? Answer: match on title + category, surface a confirmation dialog.</li>
+  <li><strong>Spec 003</strong> had an ambiguous ownership model. Who owns the category entity — spec 001 (the core data model) or spec 003 (category management)? Answer: spec 003 owns it. Spec 001 references it.</li>
+  <li><strong>Spec 006</strong> overlapped with spec 012. Both described "background data fetching." Answer: spec 012 owns the enrichment pipeline. Spec 006 owns the <em>queue</em> — it decides <em>when</em> to trigger enrichment based on network state.</li>
+  <li><strong>Spec 009</strong> was missing launch phases entirely. What happens on cold launch? Warm launch? Background wake? Deep link arrival during onboarding? This single clarification expanded spec 009 from a simple tab layout into a full app lifecycle specification.</li>
+</ul>
+
+<p>Twelve specs went in. Twelve <em>much better</em> specs came out.</p>
+
+<h3>New Specs from Clarification</h3>
+
+<p>Clarification also revealed missing specs. Spec 014 ("Future Technical Considerations") had described widgets, iCloud sync, and Siri integration as "future work." On Day 3, we promoted these to standalone specs:</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>New Spec</th>
+      <th>Promoted From</th>
+      <th>Why Standalone</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>016</td>
+      <td>Future spec item F-003</td>
+      <td>Widgets need their own data pipeline (App Group shared container)</td>
+    </tr>
+    <tr>
+      <td>017</td>
+      <td>Future spec item F-001</td>
+      <td>iCloud sync touches every model and needs a deduplication strategy</td>
+    </tr>
+    <tr>
+      <td>018</td>
+      <td>Future spec item F-002</td>
+      <td>Siri intents need <code>@Dependency</code> injection and entity definitions</td>
+    </tr>
+  </tbody>
+</table>
+
+<p><strong>Total specs: 18.</strong> The architecture was now fully mapped.</p>
+
+<h2>Package Architecture</h2>
+
+<p>With specs clarified, we could design the code structure. The constitution (Principle IV — Separation of Models and Views) demanded that business logic live in a dedicated Swift package, independent of UI:</p>
+
+<pre><code>src/
+  MyApp/                     ← App target (SwiftUI views, navigation)
+  MyAppWidget/               ← Widget extension
+  MyAppWatch/                ← watchOS companion app
+  ShareExtension/            ← Share extension for photo import
+  Packages/
+    MyKit/                   ← Swift Package (models, services, no UI)
+      Sources/
+        Models/              ← SwiftData models, schema versions
+        Services/            ← Business logic, enrichment, sync
+      Tests/
+        ModelTests/
+        ServiceTests/</code></pre>
+
+<p>This separation paid for itself immediately:</p>
+
+<ul>
+  <li>The widget, watch app, and share extension all import <code>MyKit</code> without pulling in any UI code</li>
+  <li>Tests run with <code>swift test</code> — no Xcode build required</li>
+  <li>Models and services can be tested independently of the UI</li>
+</ul>
+
+<h2>SwiftData Schema Design</h2>
+
+<p>Every spec that touched the data model had a <code>Data Model Implications</code> section. Aggregating across all 18 specs gave us the complete schema:</p>
+
+<pre><code class="language-swift">// The VersionedSchema pattern in Swift 6.2
+// Note: nonisolated(unsafe) is required because VersionedSchema
+// demands a static var, which Swift 6.2 strict concurrency flags
+// as a shared mutable state risk. This is safe because the value
+// is set once and never mutated.
+
+enum SchemaV1: VersionedSchema {
+  nonisolated(unsafe) static var versionIdentifier: Schema.Version = .init(1, 0, 0)
+
+  static var models: [any PersistentModel.Type] {
+    [Item.self, Category.self]
+  }
+
+  @Model
+  final class Item {
+    var title: String
+    var dateAdded: Date
+    var category: Category?
+    var personalNotes: String
+    var isCompleted: Bool
+    var imageURL: String?
+
+    // Enrichment fields — populated asynchronously after save
+    var externalID: String?
+    var itemDescription: String?
+    var tags: [String]
+    var enrichmentStatus: String  // "pending", "enriched", "failed"
+
+    init(title: String, category: Category? = nil) {
+      self.title = title
+      self.dateAdded = .now
+      self.personalNotes = ""
+      self.isCompleted = false
+      self.tags = []
+      self.enrichmentStatus = "pending"
+    }
+  }
+
+  @Model
+  final class Category {
+    var name: String
+    var isEnabled: Bool
+    var iconURL: String?
+
+    init(name: String) {
+      self.name = name
+      self.isEnabled = false
+    }
+  }
+}</code></pre>
+
+<h3>The Migration Plan</h3>
+
+<p>Specs predicted we'd need schema migrations. The enrichment pipeline (spec 012) would add fields. iCloud sync (spec 017) would add more. Rather than hoping we'd get the model right the first time, we built the migration infrastructure from day one:</p>
+
+<pre><code class="language-swift">enum ItemMigrationPlan: SchemaMigrationPlan {
+  static var schemas: [any VersionedSchema.Type] {
+    [SchemaV1.self]
+    // Future versions added here as specs demand them
+  }
+
+  static var stages: [MigrationStage] {
+    []
+    // Lightweight migrations added here
+  }
+}</code></pre>
+
+<p>This empty migration plan might look like over-engineering. It wasn't. When we later needed to add fields for the enrichment pipeline, the infrastructure was already there. We added a <code>SchemaV2</code>, wrote one lightweight migration stage, and moved on. Without the spec predicting this need, we'd have been restructuring our model container setup mid-implementation.</p>
+
+<h2>The Shared Model Container</h2>
+
+<p>Four targets need to access the same SwiftData store: the app, the widget, the watch payload builder, and the share extension. This is the <code>SharedModelContainer</code> pattern:</p>
+
+<pre><code class="language-swift">// Multi-target SwiftData container with CloudKit fallback
+// Uses App Group for cross-target access and CloudKit for iCloud sync.
+// Falls back gracefully if CloudKit is unavailable (e.g., simulator,
+// no iCloud account, or entitlement issues).
+
+import SwiftData
+import os
+
+struct SharedContainer {
+  private static let logger = Logger(
+    subsystem: "com.example.app",
+    category: "ModelContainer"
+  )
+
+  static func create() throws -&gt; ModelContainer {
+    let schema = Schema(versionedSchema: SchemaV1.self)
+
+    // Attempt 1: App Group + CloudKit (production path)
+    do {
+      let config = ModelConfiguration(
+        schema: schema,
+        groupContainer: .identifier("group.com.example.shared"),
+        cloudKitDatabase: .private("iCloud.com.example.app")
+      )
+      return try ModelContainer(
+        for: schema,
+        migrationPlan: ItemMigrationPlan.self,
+        configurations: [config]
+      )
+    } catch {
+      logger.warning("CloudKit container failed: \(error). Falling back to local.")
+    }
+
+    // Attempt 2: App Group only (no iCloud account or simulator)
+    let fallback = ModelConfiguration(
+      schema: schema,
+      groupContainer: .identifier("group.com.example.shared")
+    )
+    return try ModelContainer(
+      for: schema,
+      migrationPlan: ItemMigrationPlan.self,
+      configurations: [fallback]
+    )
+  }
+}</code></pre>
+
+<p>The try-catch fallback was born from a clarification question on spec 017: <em>"What happens when the user has no iCloud account?"</em> The spec said: degrade to local storage. The code does exactly that.</p>
+
+<h2>Swift Testing, Not XCTest</h2>
+
+<p>The constitution was explicit: <strong>Swift Testing only. No XCTest.</strong> This was a deliberate choice for several reasons:</p>
+
+<ol>
+  <li><strong>Swift Testing uses <code>@Test</code> and <code>#expect</code></strong> — more expressive than <code>XCTAssertEqual</code></li>
+  <li><strong>Parameterized tests</strong> with <code>@Test(arguments:)</code> eliminate boilerplate</li>
+  <li><strong>Tags and traits</strong> replace XCTest's class-based organization</li>
+  <li><strong><code>.serialized</code> trait</strong> controls execution order without subclassing</li>
+</ol>
+
+<p>Here's the testing pattern we established for SwiftData models:</p>
+
+<pre><code class="language-swift">import Testing
+import SwiftData
+@testable import MyKit
+
+@Suite(.serialized)
+@MainActor
+struct ItemModelTests {
+  let container: ModelContainer
+
+  init() throws {
+    // In-memory container for test isolation
+    let config = ModelConfiguration(isStoredInMemoryOnly: true)
+    container = try ModelContainer(
+      for: SchemaV1.Item.self, SchemaV1.Category.self,
+      configurations: config
+    )
+  }
+
+  @Test func itemDefaultsToCorrectState() throws {
+    let context = container.mainContext
+    let item = SchemaV1.Item(title: "Test Title")
+    context.insert(item)
+    try context.save()
+
+    let fetched = try context.fetch(FetchDescriptor&lt;SchemaV1.Item&gt;())
+    #expect(fetched.count == 1)
+    #expect(fetched[0].title == "Test Title")
+    #expect(fetched[0].enrichmentStatus == "pending")
+    #expect(fetched[0].isCompleted == false)
+  }
+
+  @Test(arguments: ["", "   ", "\n"])
+  func emptyTitlesArePreserved(title: String) throws {
+    // Validation happens at the UI layer, not the model layer.
+    // The model stores whatever it's given.
+    let item = SchemaV1.Item(title: title)
+    #expect(item.title == title)
+  }
+}</code></pre>
+
+<p>One hard lesson: <strong>multiple <code>@MainActor</code> test suites creating separate <code>ModelContainer</code> instances across different files causes signal 4 crashes</strong> in <code>swift test</code>. The fix was consolidating SwiftData tests into fewer files, using the <code>.serialized</code> trait, and running <code>swift test --no-parallel</code>. This is a Swift Testing + SwiftData rough edge that isn't well documented yet.</p>
+
+<h2>Spec Timeline: Day 3</h2>
+
+<table>
+  <thead>
+    <tr>
+      <th>Time</th>
+      <th>Action</th>
+      <th>Why</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Morning</td>
+      <td><code>/speckit.clarify</code> on all 12 specs</td>
+      <td>Fix scope gaps before implementation</td>
+    </tr>
+    <tr>
+      <td>Mid-morning</td>
+      <td>Create specs 013–015</td>
+      <td>Manual input, future considerations, monetization</td>
+    </tr>
+    <tr>
+      <td>Mid-day</td>
+      <td>Promote future items to specs 016–018</td>
+      <td>Widgets, iCloud, and Siri need standalone specs</td>
+    </tr>
+    <tr>
+      <td>Afternoon</td>
+      <td>Generate implementation plans for specs 001, 003, 009, 013</td>
+      <td>High-dependency specs planned first</td>
+    </tr>
+    <tr>
+      <td>Evening</td>
+      <td>Requirements quality checklists</td>
+      <td>Final validation before implementation</td>
+    </tr>
+  </tbody>
+</table>
+
+<p><strong>Commits: 60. Lines of Swift: still 0.</strong> (Well, almost zero — the package structure and model stubs were in place.)</p>
+
+<h2>The Decision to Wait</h2>
+
+<p>Three days in, a reasonable person might ask: <em>"Why haven't you written any real code yet?"</em></p>
+
+<p>The answer became obvious on Day 4, when we implemented 9 specs in a single day — 81 commits of production code, guided by plans that already knew which files to create, which services to inject, and which edge cases to handle.</p>
+
+<p>The specs didn't slow us down. They were the reason Day 4 was even possible.</p>
+
+<hr>
+
+<p><strong>Total at end of Day 3:</strong></p>
+
+<ul>
+  <li>18 feature specs (12 clarified, 6 new)</li>
+  <li>1 constitution (v1.5.0)</li>
+  <li>Package structure established</li>
+  <li>SwiftData schema with migration infrastructure</li>
+  <li>Swift Testing patterns validated</li>
+  <li>154 total commits</li>
+</ul>
+
+<p>Next up: <a href="/blog/03-implementation-explosion.md">Day 4 — 81 commits and the implementation explosion</a>.</p>
+
+<hr>
+
+<p><em>This is Part 2 of a 7-part series. <a href="/blog/README.md">Read the series overview</a>.</em></p>
+
+</body>
+</html>

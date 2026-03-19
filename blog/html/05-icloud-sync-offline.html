@@ -1,0 +1,406 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Days 7–8: iCloud Sync, Deduplication, and Offline Resilience</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      line-height: 1.6;
+      max-width: 720px;
+      margin: 2rem auto;
+      padding: 0 1rem;
+      color: #1d1d1f;
+    }
+    h1 { font-size: 1.8rem; margin-bottom: 0.25rem; }
+    h2 { margin-top: 2rem; }
+    h3 { margin-top: 1.5rem; }
+    pre {
+      background: #f5f5f7;
+      border-radius: 6px;
+      padding: 1rem;
+      overflow-x: auto;
+    }
+    pre code {
+      font-family: "SF Mono", Menlo, Consolas, monospace;
+      font-size: 0.9rem;
+    }
+    code {
+      font-family: "SF Mono", Menlo, Consolas, monospace;
+      font-size: 0.9rem;
+      background: #f5f5f7;
+      padding: 0.1em 0.3em;
+      border-radius: 3px;
+    }
+    pre code {
+      background: none;
+      padding: 0;
+    }
+    blockquote {
+      border-left: 3px solid #ccc;
+      margin-left: 0;
+      padding-left: 1rem;
+      color: #555;
+    }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      margin: 1rem 0;
+    }
+    th, td {
+      border: 1px solid #ddd;
+      padding: 0.5rem 0.75rem;
+      text-align: left;
+    }
+    th {
+      background: #f5f5f7;
+    }
+    hr {
+      border: none;
+      border-top: 1px solid #ddd;
+      margin: 2rem 0;
+    }
+    ul, ol {
+      padding-left: 1.5rem;
+    }
+    a {
+      color: #0066cc;
+    }
+  </style>
+</head>
+<body>
+
+<h1>Days 7–8: iCloud Sync, Deduplication, and Offline Resilience</h1>
+
+<p><em>Part 5 of "10 Days, 400 Commits: Building a Multi-Target iOS 26 App with AI-Driven Spec Development"</em></p>
+
+<hr>
+
+<p>iCloud sync "just works" — until you have two devices and a share extension all writing to the same container. Here's what we learned about deduplication.</p>
+
+<h2>The Promise and Reality of SwiftData + CloudKit</h2>
+
+<p>SwiftData's CloudKit integration is genuinely impressive. Add three lines to your <code>ModelConfiguration</code> and your data syncs to iCloud automatically:</p>
+
+<pre><code class="language-swift">let config = ModelConfiguration(
+  schema: schema,
+  groupContainer: .identifier("group.com.example.shared"),
+  cloudKitDatabase: .private("iCloud.com.example.app")
+)</code></pre>
+
+<p>That's it. No CKRecord mapping. No zone management. No subscription handling. SwiftData does it all.</p>
+
+<p><strong>But.</strong></p>
+
+<p>CloudKit sync is eventually consistent. When two devices create items offline and then sync, CloudKit doesn't merge — it creates both. When the same item is added via the app on one device and via Siri on another, you get two copies. When a share extension creates an item on the same device as the app, the sync round-trip can duplicate it.</p>
+
+<p>Spec 017 (iCloud Sync) predicted this. The clarification session asked: <em>"What is the deduplication strategy when the same item arrives from multiple sources?"</em> The answer became our deduplication algorithm.</p>
+
+<h2>Pattern: Reactive Deduplication</h2>
+
+<p>The strategy: listen for remote changes via <code>NSPersistentStoreRemoteChange</code>, then scan for and merge duplicates.</p>
+
+<pre><code class="language-swift">// Post-iCloud-sync deduplication.
+// Triggered reactively when remote changes arrive, not on a timer.
+// Uses external ID as the gold standard for matching, with title
+// normalization as fallback.
+
+@MainActor
+final class ItemRepository {
+  private let context: ModelContext
+
+  init(context: ModelContext) {
+    self.context = context
+
+    // Listen for iCloud sync completions
+    NotificationCenter.default.addObserver(
+      forName: .NSPersistentStoreRemoteChange,
+      object: nil,
+      queue: .main
+    ) { [weak self] _ in
+      Task { @MainActor in
+        self?.deduplicateAfterSync()
+      }
+    }
+  }
+
+  func deduplicateAfterSync() {
+    guard let allItems = try? context.fetch(FetchDescriptor&lt;SchemaV1.Item&gt;()) else { return }
+
+    // Group by external ID (definitive match)
+    let byExternalID = Dictionary(grouping: allItems.filter { $0.externalID != nil }) {
+      $0.externalID!
+    }
+
+    for (_, duplicates) in byExternalID where duplicates.count &gt; 1 {
+      mergeDuplicates(duplicates)
+    }
+
+    // Secondary pass: group by normalized title + category (fuzzy match)
+    let remaining = (try? context.fetch(FetchDescriptor&lt;SchemaV1.Item&gt;())) ?? []
+    let byTitleCategory = Dictionary(grouping: remaining) {
+      normalizeTitle($0.title) + "|" + ($0.category?.name ?? "")
+    }
+
+    for (_, duplicates) in byTitleCategory where duplicates.count &gt; 1 {
+      // Only merge if no conflicting external IDs
+      let uniqueIDs = Set(duplicates.compactMap(\.externalID))
+      guard uniqueIDs.count &lt;= 1 else { continue }
+      mergeDuplicates(duplicates)
+    }
+
+    try? context.save()
+  }
+
+  private func mergeDuplicates(_ duplicates: [SchemaV1.Item]) {
+    // Keep the "richest" record — the one with the most metadata
+    let sorted = duplicates.sorted { richness($0) &gt; richness($1) }
+    let keeper = sorted[0]
+    let losers = sorted.dropFirst()
+
+    for loser in losers {
+      // Merge any data the keeper is missing
+      if keeper.externalID == nil { keeper.externalID = loser.externalID }
+      if keeper.imageURL == nil { keeper.imageURL = loser.imageURL }
+      if keeper.tags.isEmpty { keeper.tags = loser.tags }
+      if keeper.personalNotes.isEmpty { keeper.personalNotes = loser.personalNotes }
+      if !keeper.isCompleted { keeper.isCompleted = loser.isCompleted }
+
+      context.delete(loser)
+    }
+  }
+
+  private func richness(_ item: SchemaV1.Item) -&gt; Int {
+    var score = 0
+    if item.externalID != nil { score += 4 }
+    if item.imageURL != nil { score += 2 }
+    if !item.tags.isEmpty { score += 1 }
+    if !item.personalNotes.isEmpty { score += 1 }
+    return score
+  }
+
+  private func normalizeTitle(_ title: String) -&gt; String {
+    title
+      .lowercased()
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+      .folding(options: .diacriticInsensitive, locale: .current)
+  }
+}</code></pre>
+
+<p>Key design decisions:</p>
+<ul>
+  <li><strong>Two-pass matching</strong> — First by external ID (definitive), then by normalized title (fuzzy). The fuzzy pass only fires when external IDs don't conflict.</li>
+  <li><strong>Richness scoring</strong> — The record with the most metadata survives. External ID is weighted highest because it enables future enrichment.</li>
+  <li><strong>Merge, don't pick</strong> — The keeper inherits any data the losers have that it's missing. No data is lost.</li>
+  <li><strong>Reactive trigger</strong> — Deduplication runs when <code>NSPersistentStoreRemoteChange</code> fires, not on a timer. This ensures it runs immediately after sync completes.</li>
+</ul>
+
+<h2>Pattern: Offline-First Enrichment Queue</h2>
+
+<p>The enrichment coordinator from Day 4 handles online processing. But what about items added while offline? Spec 006 (Offline Resilience) defined the queue:</p>
+
+<pre><code class="language-swift">// Enrichment status tracks where each item is in the pipeline.
+// "pending" items are queued for enrichment when network returns.
+
+enum EnrichmentStatus: String, Codable {
+  case pending     // Waiting for network or first processing attempt
+  case enriched    // Successfully enriched with metadata
+  case failed      // Enrichment attempted and failed
+
+  var needsProcessing: Bool {
+    self == .pending
+  }
+}</code></pre>
+
+<p>The coordinator's <code>processQueue()</code> method (from Day 4) already handles this: it fetches all <code>.pending</code> items and processes them one by one. When the network drops, it stops. When the network returns, it resumes.</p>
+
+<p>The <code>NetworkMonitor</code> bridge (also from Day 4) drives this reactively:</p>
+
+<pre><code class="language-swift">// In the app's root view, observe network changes
+// and trigger enrichment when connectivity returns.
+
+.onChange(of: networkMonitor.isConnected) { _, isConnected in
+  if isConnected {
+    coordinator.startProcessing()
+  }
+}</code></pre>
+
+<p>No timers. No polling. No retry loops. The network monitor publishes a state change, the coordinator processes the queue, done.</p>
+
+<h2>Constructive Error Handling</h2>
+
+<p>Constitution Principle IX became critical during sync work. iCloud sync failures are opaque — CloudKit gives you <code>CKError</code> with a code but rarely enough context to debug. Our rule: <strong>every error must carry diagnostic context</strong>.</p>
+
+<pre><code class="language-swift">// Constitution Principle IX: Errors carry full context.
+// Every catch block logs enough information to diagnose
+// the issue without reproducing it.
+
+do {
+  try context.save()
+} catch {
+  #if DEBUG
+  print("""
+  [ItemRepository] Save failed after deduplication
+    Items in context: \(context.insertedModelsArray.count) inserted, \
+    \(context.changedModelsArray.count) changed, \
+    \(context.deletedModelsArray.count) deleted
+    Error: \(error)
+  """)
+  #endif
+  // Re-throw or handle — but never silently swallow
+  throw RepositoryError.saveFailed(
+    operation: "deduplication",
+    itemCount: context.insertedModelsArray.count,
+    underlying: error
+  )
+}</code></pre>
+
+<p>The pattern: <code>#if DEBUG</code> for verbose console output (development), structured error types for programmatic handling (production). Never <code>catch { }</code>. Never <code>catch { print(error) }</code> without context.</p>
+
+<h2>Pattern: StoreKit Review Prompt</h2>
+
+<p>With core features stable, we implemented spec 022 — a review prompt that fires after genuine engagement, not on first launch:</p>
+
+<pre><code class="language-swift">// Review prompt eligibility service.
+// Pure logic — no StoreKit dependency. The view layer calls
+// requestReview() separately, only when this service says it's time.
+
+@MainActor
+@Observable
+final class ReviewPromptService {
+  private let defaults: UserDefaults
+
+  private var promptCount: Int {
+    get { defaults.integer(forKey: "reviewPromptCount") }
+    set { defaults.set(newValue, forKey: "reviewPromptCount") }
+  }
+
+  private var lastPromptDate: Date? {
+    get { defaults.object(forKey: "lastReviewPromptDate") as? Date }
+    set { defaults.set(newValue, forKey: "lastReviewPromptDate") }
+  }
+
+  private var firstItemDate: Date? {
+    get { defaults.object(forKey: "firstItemAddedDate") as? Date }
+    set { defaults.set(newValue, forKey: "firstItemAddedDate") }
+  }
+
+  var isEligible: Bool {
+    // Rule 1: Maximum 2 prompts ever
+    guard promptCount &lt; 2 else { return false }
+
+    // Rule 2: At least 30 days since last prompt
+    if let last = lastPromptDate {
+      let daysSince = Calendar.current.dateComponents(
+        [.day], from: last, to: .now
+      ).day ?? 0
+      guard daysSince &gt;= 30 else { return false }
+    }
+
+    // Rule 3: At least 7 days of active use
+    guard let firstDate = firstItemDate else { return false }
+    let daysSinceFirst = Calendar.current.dateComponents(
+      [.day], from: firstDate, to: .now
+    ).day ?? 0
+    guard daysSinceFirst &gt;= 7 else { return false }
+
+    return true
+  }
+
+  func recordPrompt() {
+    promptCount += 1
+    lastPromptDate = .now
+  }
+
+  func recordFirstItem() {
+    if firstItemDate == nil {
+      firstItemDate = .now
+    }
+  }
+}</code></pre>
+
+<p>The service is deliberately decoupled from StoreKit. It answers one question: "is now a good time to ask?" The view calls <code>requestReview(in:)</code> separately. This makes the eligibility logic testable without mocking StoreKit.</p>
+
+<h2>Spec Timeline: Days 7–8</h2>
+
+<table>
+  <thead>
+    <tr>
+      <th>Day</th>
+      <th>Spec</th>
+      <th>Action</th>
+      <th>Why</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>7</td>
+      <td>006</td>
+      <td>Implement offline resilience</td>
+      <td>NWPathMonitor queue, background enrichment</td>
+    </tr>
+    <tr>
+      <td>7</td>
+      <td>017</td>
+      <td>Begin iCloud sync implementation</td>
+      <td>SwiftData CloudKit, dedup strategy</td>
+    </tr>
+    <tr>
+      <td>7</td>
+      <td>010</td>
+      <td>Migrate API to Cloudflare Workers proxy</td>
+      <td>Remove API keys from app binary</td>
+    </tr>
+    <tr>
+      <td>7</td>
+      <td>—</td>
+      <td>Add Constitution Principle IX amendment</td>
+      <td>Constructive errors after debugging sync issues</td>
+    </tr>
+    <tr>
+      <td>8</td>
+      <td>022</td>
+      <td><strong>New spec</strong> + implement review prompt</td>
+      <td>Polish spec, engagement-based triggers</td>
+    </tr>
+    <tr>
+      <td>8</td>
+      <td>011</td>
+      <td>Disable voice dictation from UI</td>
+      <td>Latency too high for production UX</td>
+    </tr>
+    <tr>
+      <td>8</td>
+      <td>001</td>
+      <td>Update spec to match implemented model</td>
+      <td>Reflect iCloud sync reality</td>
+    </tr>
+  </tbody>
+</table>
+
+<p><strong>New spec:</strong> 022 (Store Review Prompt) — the first "polish" spec. It emerged naturally once core features were stable enough to think about App Store presence.</p>
+
+<p><strong>Feature freeze:</strong> Day 8 marks the decision to disable voice dictation (spec 011) and the camera scanner (spec 002) from user-facing UI. Both were technically working but not polished enough for the experience we wanted. Voice dictation was later fully removed; the camera feature was reworked on Day 10.</p>
+
+<p><strong>The API security milestone:</strong> On Day 7, we migrated the external API calls from direct client requests (with the API key embedded in the app binary) to a Cloudflare Workers proxy. The proxy injects the API key server-side, so the app never sees it. This was spec 010's entire purpose, and it took about 20 minutes to implement — the spec had already defined the endpoint format, the error handling, and the fallback behavior.</p>
+
+<hr>
+
+<p><strong>Total at end of Day 8:</strong></p>
+<ul>
+  <li>23 feature specs</li>
+  <li>17 specs implemented (2 disabled)</li>
+  <li>iCloud sync, offline resilience, review prompts — all working</li>
+  <li>API keys removed from app binary</li>
+  <li>357 total commits</li>
+</ul>
+
+<p>Next up: <a href="06-watch-spotlight-last-mile.html">Days 9–10 — Apple Watch, Spotlight search, and the last mile</a>.</p>
+
+<hr>
+
+<p><em>This is Part 5 of a 7-part series. <a href="../README.md">Read the series overview</a>.</em></p>
+
+</body>
+</html>
